@@ -2,45 +2,48 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useState, useEffect } from "react";
+import { supabase } from "@/lib/supabase";
 
 export default function Navbar() {
   const pathname = usePathname();
-  
-  const isAppRoute = pathname.includes('/dashboard') || pathname.includes('/results');
-  
-  if (isAppRoute) {
-    return null;
-  }
+  const [user, setUser] = useState<any>(null);
+
+  useEffect(() => {
+    supabase.auth.getUser().then(({ data }) => {
+      if (data.user) setUser(data.user);
+    });
+
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user || null);
+    });
+
+    return () => { listener.subscription.unsubscribe(); };
+  }, []);
+
+  // Hide navbar on dashboard and results pages (they have their own sidebar)
+  if (pathname?.startsWith("/dashboard") || pathname?.startsWith("/results")) return null;
 
   return (
-    <div className="fixed top-4 md:top-6 left-0 w-full flex justify-center z-50 px-4 md:px-6 pointer-events-none">
-      <nav className="pointer-events-auto w-full max-w-7xl bg-[#050505]/95 backdrop-blur-md border border-[#222] rounded-full px-6 py-3 flex justify-between items-center shadow-2xl transition-all">
-        <Link href="/" className="text-xl font-heading font-black tracking-widest uppercase text-white hover:text-acid transition-colors">
-          Aura
-        </Link>
-        
-        {!isAppRoute ? (
-          <div className="flex items-center gap-4 md:gap-8">
-            <div className="hidden md:flex gap-8 text-xs uppercase tracking-widest font-bold text-zinc-400">
-              {pathname === "/" ? (
-                <>
-                  <Link href="#engine" className="hover:text-acid transition-colors">Engine</Link>
-                  <Link href="#manifesto" className="hover:text-acid transition-colors">Manifesto</Link>
-                </>
-              ) : (
-                <Link href="/" className="hover:text-acid transition-colors">Home</Link>
-              )}
-            </div>
-            <Link href="/signup" className="text-xs font-bold uppercase tracking-widest border border-zinc-700 px-6 py-2 rounded-full hover:border-acid hover:text-acid transition-all bg-[#111] text-white shadow-lg">
+    <nav className="fixed top-0 left-0 right-0 z-50 flex justify-between items-center px-6 md:px-12 py-5 bg-black/80 backdrop-blur-md border-b border-[#222]">
+      <Link href="/" className="text-2xl font-heading font-black tracking-widest uppercase text-white hover:text-acid transition-colors">
+        Aura
+      </Link>
+      <div className="flex items-center gap-6 font-mono text-sm uppercase font-bold">
+        <Link href="/#engine" className="text-gray-400 hover:text-white transition-colors hidden sm:block">Engine</Link>
+        {user ? (
+          <Link href="/dashboard" className="bg-acid text-black px-6 py-2 rounded-full hover:bg-white transition-colors tracking-widest">
+            Dashboard
+          </Link>
+        ) : (
+          <>
+            <Link href="/login" className="text-gray-400 hover:text-white transition-colors">Log In</Link>
+            <Link href="/signup" className="bg-acid text-black px-6 py-2 rounded-full hover:bg-white transition-colors tracking-widest">
               Sign Up
             </Link>
-          </div>
-        ) : (
-          <div className="flex items-center gap-4">
-            <div className="w-10 h-10 rounded-full bg-acid text-black flex items-center justify-center font-bold font-heading text-lg">JD</div>
-          </div>
+          </>
         )}
-      </nav>
-    </div>
+      </div>
+    </nav>
   );
 }

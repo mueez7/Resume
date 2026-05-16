@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import multer from 'multer';
 import OpenAI from 'openai';
+import { createClient } from '@supabase/supabase-js';
 
 dotenv.config();
 
@@ -12,10 +13,29 @@ const pdfParse = require('pdf-parse/lib/pdf-parse.js');
 const app = express();
 const port = process.env.PORT || 5000;
 
-app.use(cors());
-app.use(express.json());
+app.use(cors({
+  origin: ['http://localhost:3000', 'http://localhost:3001'],
+  credentials: true,
+}));
+app.use(express.json({ limit: '10mb' }));
 
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype === 'application/pdf') {
+      cb(null, true);
+    } else {
+      cb(new Error('Only PDF files are allowed.'));
+    }
+  },
+});
+
+// Supabase admin client (optional - only if env vars present)
+const supabase =
+  process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
+    ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
+    : null;
 
 // OpenRouter client
 const client = new OpenAI({
@@ -27,158 +47,173 @@ const client = new OpenAI({
   },
 });
 
-// Use a model that is reliable with structured JSON output
-const FREE_MODEL = 'deepseek/deepseek-v4-flash:free';
+// Model fallback chain - tries each in order
+const MODELS = [
+  'deepseek/deepseek-r1:free',
+  'meta-llama/llama-4-scout:free',
+  'google/gemma-3-27b-it:free',
+  'deepseek/deepseek-v3-base:free',
+];
 
-/**
- * Attempts to repair truncated or malformed JSON by closing all open
- * brackets/braces and quotes, then parsing again.
- */
+// ========================
+// UTILITIES
+// ========================
+
 function repairJSON(raw: string): string {
   let text = raw.trim();
-
-  // Remove trailing commas before closing brackets (common AI mistake)
   text = text.replace(/,\s*([\]}])/g, '$1');
-
-  // Track open structures
   const stack: string[] = [];
   let inString = false;
   let escape = false;
-
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
-
-    if (escape) {
-      escape = false;
-      continue;
-    }
-
-    if (ch === '\\' && inString) {
-      escape = true;
-      continue;
-    }
-
-    if (ch === '"') {
-      inString = !inString;
-      continue;
-    }
-
+    if (escape) { escape = false; continue; }
+    if (ch === '\\' && inString) { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
     if (!inString) {
       if (ch === '{') stack.push('}');
       else if (ch === '[') stack.push(']');
       else if (ch === '}' || ch === ']') {
-        if (stack.length > 0 && stack[stack.length - 1] === ch) {
-          stack.pop();
-        }
+        if (stack.length > 0 && stack[stack.length - 1] === ch) stack.pop();
       }
     }
   }
-
-  // Close any open string
   if (inString) text += '"';
-
-  // Remove trailing comma before we close brackets
   text = text.replace(/,\s*$/, '');
-
-  // Close all open structures in reverse order
-  while (stack.length > 0) {
-    text += stack.pop();
-  }
-
+  while (stack.length > 0) text += stack.pop();
   return text;
 }
 
-/**
- * Robustly extracts a JSON object from a raw AI string.
- * Handles: <think> blocks, markdown fences, leading/trailing text, truncated JSON.
- */
-function extractJSON(raw: string): object {
-  // 1. Strip <think>...</think> reasoning blocks (DeepSeek models)
+function extractJSON(raw: string): Record<string, unknown> {
+  // Strip reasoning/think blocks
   let text = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-
-  // 2. Strip markdown code fences ```json ... ```
+  // Strip markdown fences
   text = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
-
-  // 3. Find the first { to start of JSON object
+  // Find first {
   const startIdx = text.indexOf('{');
-  if (startIdx > 0) {
-    text = text.slice(startIdx);
-  }
+  if (startIdx > 0) text = text.slice(startIdx);
 
-  // 4. Try to parse directly first
-  try {
-    return JSON.parse(text);
-  } catch {
-    console.warn('Direct JSON parse failed, attempting repair...');
-  }
+  // Try direct parse
+  try { return JSON.parse(text); } catch { /* fall through */ }
 
-  // 5. Try extracting the largest { ... } block
+  // Try largest block
   const match = text.match(/\{[\s\S]*\}/);
   if (match) {
-    try {
-      return JSON.parse(match[0]);
-    } catch {
-      console.warn('Block extraction parse failed, attempting JSON repair...');
-      // 6. Attempt to repair and re-parse
-      try {
-        const repaired = repairJSON(match[0]);
-        console.log('Repaired JSON (first 200):', repaired.slice(0, 200));
-        return JSON.parse(repaired);
-      } catch {
-        console.warn('Repair failed on block, trying full text repair...');
-      }
-    }
+    try { return JSON.parse(match[0]); } catch { /* fall through */ }
+    try { return JSON.parse(repairJSON(match[0])); } catch { /* fall through */ }
   }
 
-  // 7. Last resort: repair the full text
-  try {
-    const repaired = repairJSON(text);
-    return JSON.parse(repaired);
-  } catch {
-    throw new Error(
-      'Could not extract valid JSON from AI response. Raw (first 300 chars): ' + raw.slice(0, 300)
-    );
-  }
+  // Last resort: repair full text
+  try { return JSON.parse(repairJSON(text)); } catch { /* fall through */ }
+
+  throw new Error('Could not parse AI response as JSON.');
 }
 
-/**
- * Ensures the parsed AI data has all required fields with safe defaults.
- */
-function sanitizeAnalysisData(data: Record<string, unknown>): Record<string, unknown> {
+function sanitizeAnalysis(data: Record<string, unknown>): Record<string, unknown> {
+  const toNum = (v: unknown, min = 0, max = 100, def = 0) =>
+    typeof v === 'number' ? Math.max(min, Math.min(max, Math.round(v))) : def;
+
   return {
-    atsScore: typeof data.atsScore === 'number' ? Math.max(0, Math.min(100, data.atsScore)) : 0,
-    weakPoints: Array.isArray(data.weakPoints) ? data.weakPoints.slice(0, 5) : [],
+    atsScore: toNum(data.atsScore, 0, 100, 0),
+    weakPoints: Array.isArray(data.weakPoints)
+      ? (data.weakPoints as string[]).filter(Boolean).slice(0, 6)
+      : [],
     rewrittenBullets: Array.isArray(data.rewrittenBullets)
       ? (data.rewrittenBullets as Record<string, unknown>[])
           .filter((b) => b && typeof b === 'object' && 'original' in b && 'optimized' in b)
-          .slice(0, 5)
-      : [{ original: 'Could not parse bullets.', optimized: 'Please try re-uploading.' }],
-    missingSkills: Array.isArray(data.missingSkills) ? data.missingSkills.slice(0, 6) : [],
+          .slice(0, 6)
+      : [{ original: 'Could not parse.', optimized: 'Please try again.' }],
+    missingSkills: Array.isArray(data.missingSkills)
+      ? (data.missingSkills as string[]).filter(Boolean).slice(0, 8)
+      : [],
     skillGaps: Array.isArray(data.skillGaps)
       ? (data.skillGaps as Record<string, unknown>[])
-          .filter(
-            (g) =>
-              g &&
-              typeof g === 'object' &&
-              'skillName' in g &&
-              'userScore' in g &&
-              'marketRequirement' in g
-          )
-          .slice(0, 6)
-      : [{ skillName: 'General', userScore: 50, marketRequirement: 80 }],
+          .filter((g) => g && typeof g === 'object' && 'skillName' in g)
+          .map((g) => ({
+            skillName: String(g.skillName),
+            userScore: toNum(g.userScore, 0, 100, 40),
+            marketRequirement: toNum(g.marketRequirement, 0, 100, 80),
+          }))
+          .slice(0, 8)
+      : [{ skillName: 'General', userScore: 40, marketRequirement: 80 }],
     interviewQuestions: Array.isArray(data.interviewQuestions)
-      ? data.interviewQuestions.slice(0, 6)
-      : ['Could not generate questions. Please try again.'],
+      ? (data.interviewQuestions as string[]).filter(Boolean).slice(0, 8)
+      : ['Please try re-uploading your resume.'],
+    summary: typeof data.summary === 'string' ? data.summary : '',
   };
 }
 
-// =====================
+async function callAIWithFallback(
+  messages: { role: string; content: string }[],
+  maxTokens = 1800
+): Promise<string> {
+  let lastError: Error | null = null;
+
+  for (const model of MODELS) {
+    try {
+      console.log(`🤖 Trying model: ${model}`);
+      const completion = await client.chat.completions.create({
+        model,
+        max_tokens: maxTokens,
+        messages: messages as Parameters<typeof client.chat.completions.create>[0]['messages'],
+      });
+      const content = completion.choices[0]?.message?.content || '';
+      if (content.trim()) {
+        console.log(`✅ Got response from ${model} (${content.length} chars)`);
+        return content;
+      }
+      throw new Error('Empty response');
+    } catch (err) {
+      lastError = err as Error;
+      console.warn(`⚠️  Model ${model} failed: ${lastError.message}`);
+    }
+  }
+
+  throw lastError || new Error('All AI models failed.');
+}
+
+async function extractPDFText(buffer: Buffer): Promise<string> {
+  try {
+    const data = await pdfParse(buffer, {
+      // More robust options
+      max: 0, // no page limit
+    });
+    const text = (data.text as string).trim();
+    if (text.length > 50) return text;
+    throw new Error('Extracted text too short');
+  } catch (err) {
+    console.error('Primary PDF parse failed:', (err as Error).message);
+    // Try a second pass with different options
+    try {
+      const data = await pdfParse(buffer);
+      return (data.text as string).trim();
+    } catch {
+      throw new Error(
+        'Could not extract text from this PDF. Please ensure the PDF contains selectable text (not a scanned image). Try re-saving as a text-based PDF.'
+      );
+    }
+  }
+}
+
+// ========================
+// GET /api/health
+// ========================
+app.get('/api/health', (_req: Request, res: Response) => {
+  res.json({
+    status: 'online',
+    models: MODELS,
+    supabase: supabase ? 'connected' : 'not configured',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// ========================
 // POST /api/analyze
-// =====================
+// ========================
 app.post('/api/analyze', upload.single('resume'), async (req: Request, res: Response): Promise<void> => {
   try {
     if (!req.file) {
-      res.status(400).json({ error: 'No resume file uploaded.' });
+      res.status(400).json({ error: 'No resume file uploaded. Please upload a PDF.' });
       return;
     }
 
@@ -187,88 +222,114 @@ app.post('/api/analyze', upload.single('resume'), async (req: Request, res: Resp
       return;
     }
 
-    const { targetRole, salary, workType } = req.body;
+    const { targetRole, salary, workType, userId } = req.body;
 
-    // Extract text from PDF
-    const pdfData = await pdfParse(req.file.buffer);
-    // Limit resume text to prevent token overflow (roughly 3000 chars ~ 750 tokens)
-    const resumeText = (pdfData.text as string).slice(0, 3500);
+    // Step 1: Extract PDF text
+    console.log(`\n📄 Parsing PDF (${req.file.size} bytes)...`);
+    const fullText = await extractPDFText(req.file.buffer);
+    // Limit to ~4000 chars (~1000 tokens) to stay within free model limits
+    const resumeText = fullText.slice(0, 4000);
+    console.log(`📝 Extracted ${resumeText.length} chars from PDF`);
 
-    console.log(`\n📄 Analyzing resume for: "${targetRole}" | ${workType} | ${salary}`);
-    console.log(`📝 Resume text length: ${resumeText.length} chars`);
+    if (resumeText.length < 100) {
+      res.status(400).json({
+        error: 'Resume text too short. Ensure your PDF contains selectable text, not just images.',
+      });
+      return;
+    }
 
-    const completion = await client.chat.completions.create({
-      model: FREE_MODEL,
-      max_tokens: 1500,
-      messages: [
-        {
-          role: 'system',
-          content: `You are an expert ATS resume analyzer. Respond ONLY with a single valid JSON object. No markdown, no code fences, no explanation text.
+    const role = targetRole || 'Software Engineer';
+    const env = workType || 'remote';
+    const pay = salary || 'Not specified';
 
-Required JSON schema (keep arrays SHORT - max 4 items each to ensure valid JSON output):
+    console.log(`🎯 Analyzing for: "${role}" | ${env} | ${pay}`);
+
+    // Step 2: Call AI
+    const raw = await callAIWithFallback([
+      {
+        role: 'system',
+        content: `You are an expert ATS resume analyzer and career coach. Analyze the resume and respond ONLY with a single valid JSON object. No markdown, no code fences, no explanation text outside the JSON.
+
+Required JSON schema (keep values concise, arrays max 6 items):
 {
   "atsScore": <integer 0-100>,
-  "weakPoints": ["string1", "string2", "string3"],
+  "summary": "<2-3 sentence overall assessment of the candidate>",
+  "weakPoints": ["weakness 1", "weakness 2", "weakness 3"],
   "rewrittenBullets": [
-    {"original": "string", "optimized": "string"},
-    {"original": "string", "optimized": "string"},
-    {"original": "string", "optimized": "string"}
+    {"original": "<original weak bullet>", "optimized": "<stronger rewritten version with metrics>"},
+    {"original": "<original weak bullet>", "optimized": "<stronger rewritten version with metrics>"}
   ],
-  "missingSkills": ["skill1", "skill2", "skill3"],
+  "missingSkills": ["skill1", "skill2", "skill3", "skill4"],
   "skillGaps": [
-    {"skillName": "string", "userScore": <0-100>, "marketRequirement": <0-100>},
-    {"skillName": "string", "userScore": <0-100>, "marketRequirement": <0-100>},
-    {"skillName": "string", "userScore": <0-100>, "marketRequirement": <0-100>}
+    {"skillName": "<skill name>", "userScore": <0-100>, "marketRequirement": <0-100>},
+    {"skillName": "<skill name>", "userScore": <0-100>, "marketRequirement": <0-100>}
   ],
-  "interviewQuestions": ["question1", "question2", "question3", "question4"]
+  "interviewQuestions": ["question 1", "question 2", "question 3", "question 4", "question 5"]
 }`,
-        },
-        {
-          role: 'user',
-          content: `Analyze this resume for the role: ${targetRole || 'Software Engineer'}
-Work Type: ${workType || 'remote'}
-Expected Salary: ${salary || 'Not specified'}
+      },
+      {
+        role: 'user',
+        content: `Analyze this resume for the role: ${role}
+Work Environment: ${env}
+Expected Salary: ${pay}
 
-Resume text:
+Resume Text:
 ${resumeText}`,
-        },
-      ],
-    });
+      },
+    ]);
 
-    const raw = completion.choices[0]?.message?.content || '{}';
-    console.log('\n🤖 Raw AI response (first 500 chars):');
-    console.log(raw.slice(0, 500));
-    console.log('...\n');
+    console.log('\n🔍 Raw AI response (first 300 chars):', raw.slice(0, 300));
 
+    // Step 3: Parse & sanitize
     let parsedData: Record<string, unknown>;
     try {
-      parsedData = extractJSON(raw) as Record<string, unknown>;
-    } catch (parseError) {
-      console.error('❌ JSON extraction completely failed:', (parseError as Error).message);
-      // Return a graceful fallback instead of crashing
+      parsedData = extractJSON(raw);
+    } catch (parseErr) {
+      console.error('❌ JSON parse completely failed:', (parseErr as Error).message);
       parsedData = {
-        atsScore: 0,
-        weakPoints: ['AI response could not be parsed. Please try again.'],
-        rewrittenBullets: [{ original: 'Parse error', optimized: 'Please re-upload your resume.' }],
+        atsScore: 50,
+        summary: 'Analysis complete but response parsing encountered an issue. Core data recovered.',
+        weakPoints: ['AI response parsing issue - please try again for full analysis'],
+        rewrittenBullets: [{ original: 'Parse error', optimized: 'Please re-upload for full analysis.' }],
         missingSkills: [],
-        skillGaps: [{ skillName: 'General Skills', userScore: 40, marketRequirement: 80 }],
-        interviewQuestions: ['Please try re-uploading your resume for a full analysis.'],
+        skillGaps: [{ skillName: 'General Skills', userScore: 50, marketRequirement: 80 }],
+        interviewQuestions: ['Please try re-uploading for interview questions.'],
       };
     }
 
-    const safeData = sanitizeAnalysisData(parsedData);
+    const safeData = sanitizeAnalysis(parsedData);
     console.log('✅ Analysis complete. ATS Score:', safeData.atsScore);
-    res.json(safeData);
 
+    // Step 4: Save to Supabase if userId provided and Supabase is configured
+    if (supabase && userId) {
+      try {
+        await supabase.from('analyses').insert({
+          user_id: userId,
+          target_role: role,
+          expected_salary: pay,
+          environment: env,
+          raw_text: resumeText,
+          ats_score: safeData.atsScore,
+          ai_feedback: safeData,
+        });
+        console.log('💾 Analysis saved to Supabase for user:', userId);
+      } catch (dbErr) {
+        console.warn('⚠️  Could not save to Supabase:', (dbErr as Error).message);
+        // Don't fail the request just because DB save failed
+      }
+    }
+
+    res.json({ ...safeData, resumeText: resumeText.slice(0, 1000) });
   } catch (error) {
-    console.error('❌ Error analyzing resume:', error);
-    res.status(500).json({ error: 'Failed to analyze resume. ' + (error as Error).message });
+    const msg = (error as Error).message;
+    console.error('❌ Error analyzing resume:', msg);
+    res.status(500).json({ error: msg || 'Failed to analyze resume. Please try again.' });
   }
 });
 
-// =====================
+// ========================
 // POST /api/cover-letter
-// =====================
+// ========================
 app.post('/api/cover-letter', async (req: Request, res: Response): Promise<void> => {
   try {
     if (!process.env.OPENROUTER_API_KEY) {
@@ -276,35 +337,77 @@ app.post('/api/cover-letter', async (req: Request, res: Response): Promise<void>
       return;
     }
 
-    const { targetRole, company, resumeText } = req.body;
+    const { targetRole, company, resumeText, userName } = req.body;
 
-    const completion = await client.chat.completions.create({
-      model: FREE_MODEL,
-      max_tokens: 800,
-      messages: [
+    if (!targetRole) {
+      res.status(400).json({ error: 'targetRole is required.' });
+      return;
+    }
+
+    console.log(`\n📝 Generating cover letter for: "${targetRole}" at "${company || 'the company'}"`);
+
+    const raw = await callAIWithFallback(
+      [
         {
           role: 'system',
-          content: 'You are an elite career coach. Write a highly tailored, impactful cover letter. Return only the cover letter text, no extra commentary.',
+          content: `You are an elite career coach who writes powerful, personalized cover letters. Write a professional, compelling cover letter that:
+- Is addressed to the hiring team at the company (use "Dear Hiring Team" if no specific contact)
+- Highlights the most relevant experience from the resume
+- Is 3-4 paragraphs, confident and direct
+- Ends with a strong call to action
+Return ONLY the cover letter text with no extra commentary, labels, or markdown.`,
         },
         {
           role: 'user',
-          content: `Job Title: ${targetRole}\nCompany: ${company}\n\nResume:\n${(resumeText as string || '').slice(0, 2000)}`,
+          content: `Write a cover letter for:
+Applicant Name: ${userName || 'the applicant'}
+Job Title: ${targetRole}
+Company: ${company || 'the company'}
+
+Resume (summary):
+${(resumeText || '').slice(0, 2500)}`,
         },
       ],
-    });
+      1000
+    );
 
-    const text = completion.choices[0]?.message?.content || '';
-    // Strip any <think> blocks from cover letter too
-    const cleaned = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-
+    // Clean up any think blocks or extra text
+    const cleaned = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    console.log('✅ Cover letter generated.');
     res.json({ coverLetter: cleaned });
-
   } catch (error) {
-    console.error('Error generating cover letter:', error);
-    res.status(500).json({ error: 'Failed to generate cover letter. ' + (error as Error).message });
+    const msg = (error as Error).message;
+    console.error('❌ Cover letter error:', msg);
+    res.status(500).json({ error: msg || 'Failed to generate cover letter.' });
+  }
+});
+
+// ========================
+// GET /api/analyses/:userId
+// ========================
+app.get('/api/analyses/:userId', async (req: Request, res: Response): Promise<void> => {
+  if (!supabase) {
+    res.json({ analyses: [] });
+    return;
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('analyses')
+      .select('id, target_role, ats_score, environment, created_at')
+      .eq('user_id', req.params.userId)
+      .order('created_at', { ascending: false })
+      .limit(10);
+
+    if (error) throw error;
+    res.json({ analyses: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
   }
 });
 
 app.listen(port, () => {
-  console.log(`✅ Backend running on port ${port} | Model: ${FREE_MODEL}`);
+  console.log(`\n🚀 Aura Backend online → http://localhost:${port}`);
+  console.log(`📡 Model chain: ${MODELS.join(' → ')}`);
+  console.log(`💾 Supabase: ${supabase ? 'connected' : 'not configured (analyses won\'t be saved)'}\n`);
 });
