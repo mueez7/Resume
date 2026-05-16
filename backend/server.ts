@@ -49,10 +49,10 @@ const client = new OpenAI({
 
 // Model fallback chain - tries each in order
 const MODELS = [
-  'deepseek/deepseek-r1:free',
-  'meta-llama/llama-4-scout:free',
-  'google/gemma-3-27b-it:free',
-  'deepseek/deepseek-v3-base:free',
+  'deepseek/deepseek-v4-flash:free',
+  'google/gemma-4-31b-it:free',
+  'nvidia/nemotron-3-super-120b-a12b:free',
+  'minimax/minimax-m2.5:free'
 ];
 
 // ========================
