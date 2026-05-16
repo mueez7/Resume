@@ -1,0 +1,146 @@
+@import url('https://api.fontshare.com/v2/css?f[]=clash-display@200,300,400,500,600,700&display=swap');
+@import "tailwindcss";
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-acid: var(--acid);
+  --color-dark: var(--dark);
+  --font-sans: var(--font-inter);
+  --font-heading: "Clash Display", sans-serif;
+}
+
+:root {
+  --background: #000000;
+  --foreground: #ffffff;
+  --acid: #D6FF00;
+  --dark: #000000;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+}
+
+.aurora-bg {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 120vw;
+  height: 120vh;
+  background: radial-gradient(circle at 50% 50%, rgba(214, 255, 0, 0.08) 0%, transparent 60%);
+  transform: translate(-50%, -50%);
+  filter: blur(80px);
+  animation: aurora-float 20s infinite ease-in-out;
+}
+
+@keyframes aurora-float {
+  0% { transform: translate(-50%, -50%) scale(1); }
+  33% { transform: translate(-40%, -60%) scale(1.1); }
+  66% { transform: translate(-60%, -40%) scale(0.9); }
+  100% { transform: translate(-50%, -50%) scale(1); }
+}
+
+/* Noise Texture for Premium Feel */
+.noise {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  pointer-events: none;
+  z-index: 50;
+  opacity: 0.04;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E");
+}
+
+/* Outline Text Utility */
+.text-outline {
+  color: transparent;
+  -webkit-text-stroke: 1px #f4f4f5;
+}
+
+/* Button Hover Effect */
+.btn-acid {
+  position: relative;
+  overflow: hidden;
+  z-index: 1;
+  transition: color 0.4s cubic-bezier(0.3, 1, 0.2, 1);
+}
+
+.btn-acid::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background-color: #050505;
+  transform: scaleY(0);
+  transform-origin: bottom center;
+  transition: transform 0.4s cubic-bezier(0.3, 1, 0.2, 1);
+  z-index: -1;
+}
+
+.btn-acid:hover {
+  color: var(--acid);
+  border-color: var(--acid);
+}
+
+.btn-acid:hover::after {
+  transform: scaleY(1);
+}
+
+.marquee-text {
+  transition: color 0.3s;
+}
+
+.marquee-text:hover {
+  color: var(--acid);
+  -webkit-text-stroke: 1px var(--acid);
+}
+
+/* Brutalist utilities for the other pages */
+.brutalist-border {
+  border: 1px solid #333;
+}
+
+.brutalist-button {
+  background-color: transparent;
+  border: 1px solid #f4f4f5;
+  color: #f4f4f5;
+  text-transform: uppercase;
+  font-family: var(--font-heading);
+  font-weight: 600;
+  transition: all 0.2s ease;
+}
+
+.brutalist-button:hover {
+  background-color: var(--acid);
+  color: #000;
+  border-color: var(--acid);
+}
+
+/* Hide scrollbar but keep functionality for lenis */
+::-webkit-scrollbar {
+  display: none;
+}
+html {
+  scrollbar-width: none;
+}
+
+.custom-scrollbar::-webkit-scrollbar {
+  display: block;
+  width: 4px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #333;
+  border-radius: 4px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: var(--acid);
+}
