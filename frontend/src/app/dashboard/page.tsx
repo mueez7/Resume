@@ -74,9 +74,16 @@ export default function Dashboard() {
       formData.append("workType", workType);
       if (user?.id) formData.append("userId", user.id);
 
+      const { data: { session } } = await supabase.auth.getSession();
+      const headers: Record<string, string> = {};
+      if (session?.access_token) {
+        headers['Authorization'] = `Bearer ${session.access_token}`;
+      }
+
       setProcessingStep("Extracting resume text...");
       const res = await fetch("http://localhost:5000/api/analyze", {
         method: "POST",
+        headers,
         body: formData,
       });
 

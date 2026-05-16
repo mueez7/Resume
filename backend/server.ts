@@ -300,22 +300,37 @@ ${resumeText}`,
     const safeData = sanitizeAnalysis(parsedData);
     console.log('✅ Analysis complete. ATS Score:', safeData.atsScore);
 
-    // Step 4: Save to Supabase if userId provided and Supabase is configured
-    if (supabase && userId) {
-      try {
-        await supabase.from('analyses').insert({
-          user_id: userId,
-          target_role: role,
-          expected_salary: pay,
-          environment: env,
-          raw_text: resumeText,
-          ats_score: safeData.atsScore,
-          ai_feedback: safeData,
+    // Step 4: Save to Supabase if userId provided
+    if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY && userId) {
+      const authHeader = req.headers.authorization;
+      if (authHeader) {
+        const token = authHeader.replace('Bearer ', '');
+        const reqSupabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
+          global: {
+            headers: {
+              Authorization: `Bearer ${token}`
+            }
+          }
         });
-        console.log('💾 Analysis saved to Supabase for user:', userId);
-      } catch (dbErr) {
-        console.warn('⚠️  Could not save to Supabase:', (dbErr as Error).message);
-        // Don't fail the request just because DB save failed
+
+        try {
+          const { error: dbErr } = await reqSupabase.from('analyses').insert({
+            user_id: userId,
+            target_role: role,
+            expected_salary: pay,
+            environment: env,
+            raw_text: resumeText,
+            ats_score: safeData.atsScore,
+            ai_feedback: safeData,
+          });
+          if (dbErr) throw new Error(dbErr.message);
+          console.log('💾 Analysis saved to Supabase for user:', userId);
+        } catch (dbErr) {
+          console.warn('⚠️  Could not save to Supabase:', (dbErr as Error).message);
+          // Don't fail the request just because DB save failed
+        }
+      } else {
+        console.warn('⚠️  No Authorization header provided, skipping Supabase save.');
       }
     }
 
@@ -386,13 +401,19 @@ ${(resumeText || '').slice(0, 2500)}`,
 // GET /api/analyses/:userId
 // ========================
 app.get('/api/analyses/:userId', async (req: Request, res: Response): Promise<void> => {
-  if (!supabase) {
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY) {
     res.json({ analyses: [] });
     return;
   }
 
   try {
-    const { data, error } = await supabase
+    const authHeader = req.headers.authorization;
+    const token = authHeader ? authHeader.replace('Bearer ', '') : '';
+    const reqSupabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
+      global: { headers: { Authorization: `Bearer ${token}` } }
+    });
+
+    const { data, error } = await reqSupabase
       .from('analyses')
       .select('id, target_role, ats_score, environment, created_at')
       .eq('user_id', req.params.userId)
@@ -409,5 +430,5 @@ app.get('/api/analyses/:userId', async (req: Request, res: Response): Promise<vo
 app.listen(port, () => {
   console.log(`\n🚀 Aura Backend online → http://localhost:${port}`);
   console.log(`📡 Model chain: ${MODELS.join(' → ')}`);
-  console.log(`💾 Supabase: ${supabase ? 'connected' : 'not configured (analyses won\'t be saved)'}\n`);
+  console.log(`💾 Supabase: ${process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY ? 'connected' : 'not configured (analyses won\'t be saved)'}\n`);
 });
